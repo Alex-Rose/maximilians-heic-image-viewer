@@ -361,7 +361,8 @@ bool VIEWINFO::onMouseWheel(short nButtonType, short nWheelDelta, POINT pt)
 
 bool VIEWINFO::startScroll(HWND hwnd, UINT buttonType, POINT pt)
 {
-	if (PtInRect(&rectH, pt))
+	// rectH and rectV keep where the scrollers were last drawn. ignore them while the scrollers are hidden.
+	if ((scrollH & VI_SCROLLER_VISIBLE) && PtInRect(&rectH, pt))
 	{
 		scrollH |= VI_SCROLLER_CAPTURED;
 		ptCapture = pt;
@@ -369,7 +370,7 @@ bool VIEWINFO::startScroll(HWND hwnd, UINT buttonType, POINT pt)
 		SetCapture(hwnd);
 		return true;
 	}
-	if (PtInRect(&rectV, pt))
+	if ((scrollV & VI_SCROLLER_VISIBLE) && PtInRect(&rectV, pt))
 	{
 		scrollV |= VI_SCROLLER_CAPTURED;
 		ptCapture = pt;
@@ -563,7 +564,9 @@ void MainDlg::_sizeWindow(SIZE viewSize)
 		pos.x = mi.rcWork.left;
 	if (pos.y < mi.rcWork.top)
 		pos.y = mi.rcWork.top;
+	_sizingWindow = true;
 	SetWindowPos(_hdlg, NULL, pos.x, pos.y, szDlg.cx, szDlg.cy, SWP_NOZORDER | SWP_NOACTIVATE);
+	_sizingWindow = false;
 	// WM_SIZE does not arrive if the size has not changed. so, update the page here too.
 	GetClientRect(_hdlg, &rc);
 	_vi.szPage = { rc.right - 2 * PHOTOMARGIN_CX, rc.bottom - 2 * PHOTOMARGIN_CY };
@@ -673,9 +676,26 @@ void MainDlg::_setZoom(int ratio, POINT anchor)
 	_vi.ptPage.x = anchor.x - (int)(fx * _vi.szImage.cx);
 	_vi.ptPage.y = anchor.y - (int)(fy * _vi.szImage.cy);
 	_layoutPage();
+	// a zoom chosen by the user is kept when the window is resized. Fit to Window and _refit turn fit mode back on.
+	_fitMode = false;
 	_setCaption(1);
 	SetCursor(NULL);
 	InvalidateRect(_hdlg, NULL, FALSE);
+}
+
+// fits the photo in the window again if the zoom is in fit mode.
+void MainDlg::_refit()
+{
+	if (!_fitMode || !_heif || !_hbmpImage)
+		return;
+	_setZoom(_fitZoom(), _pageCenter());
+	_fitMode = true;
+}
+
+// once the user has sized or maximized the window, new photos are fitted in it instead of the window being sized to each photo.
+bool MainDlg::_keepWindowSize()
+{
+	return _userSized || IsZoomed(_hdlg);
 }
 
 // asks IDM_DECODE to open the photo at path.
@@ -784,7 +804,17 @@ BOOL MainDlg::OnCommand(WPARAM wp_, LPARAM lp_)
 				_heif = h;
 				_filename = _nextFilename;
 				_updatePhotoPosition();
-				_autoZoom(true);
+				if (_keepWindowSize())
+				{
+					// fit the photo in the window the user has sized.
+					_vi.zoomAuto = _vi.zoomRatio = _fitZoom();
+					_vi.szImage = _vi.szAuto = { MulDiv(_vi.zoomRatio, _heif->_imageSize.cx, 100), MulDiv(_vi.zoomRatio, _heif->_imageSize.cy, 100) };
+					_vi.ptPage = { 0 };
+					_layoutPage();
+				}
+				else
+					_autoZoom(true);
+				_fitMode = true;
 				_setCaption();
 				PostMessage(_hdlg, WM_COMMAND, MAKEWPARAM(IDM_DECODE, 0), 1);
 			}
@@ -850,7 +880,10 @@ BOOL MainDlg::OnCommand(WPARAM wp_, LPARAM lp_)
 		return TRUE;
 	case IDM_ZOOM_FIT:
 		if (_heif)
+		{
 			_setZoom(_fitZoom(), _pageCenter());
+			_fitMode = true;
+		}
 		return TRUE;
 	case IDM_ZOOM_100:
 		_setZoom(100, _pageCenter());
@@ -886,6 +919,18 @@ void MainDlg::OnButtonRotate()
 		DeleteObject(_hbmpImage);
 	// get the heic image rotated by 45 degrees.
 	_hbmpImage = _heif->rotate(_vi.szImage);
+	if (_keepWindowSize())
+	{
+		// keep the window the user has sized. center the rotated image in it, or fit it again if the zoom is in fit mode.
+		_vi.ptPage.x = (_vi.szPage.cx - _vi.szImage.cx) / 2;
+		_vi.ptPage.y = (_vi.szPage.cy - _vi.szImage.cy) / 2;
+		_layoutPage();
+		_refit();
+		_setCaption(_fitMode ? 0 : 1);
+		SetCursor(NULL);
+		InvalidateRect(_hdlg, NULL, FALSE);
+		return;
+	}
 	// update the window size so that the rotated image fits.
 	// note that szAuto has optimal viewport extents. it's the reference size we go back to after each operation of zoom or rotation, although the cx and cy may have to be swapped. szImage is the actual image extents after the rotation. if the orientations of the two sets of extents differ, swap the extents of szAuto to correct the orientation of the reference size.
 	_vi.szPage = _vi.szImage;
@@ -918,6 +963,40 @@ void MainDlg::OnSize(UINT nType, int cx, int cy)
 	_vi.szPage.cx = cx-2* PHOTOMARGIN_CX;
 	_vi.szPage.cy = cy-2* PHOTOMARGIN_CY;
 	_layoutPage();
+	InvalidateRect(_hdlg, NULL, FALSE);
+	// a size change we did not make, outside a frame drag, is a maximize, a restore or a snap. fit the photo right away.
+	// while the user drags the frame, OnExitSizeMove fits it once at the end. rescaling a large photo at every step would be slow.
+	if (!_sizingWindow && !_inSizeMove && _hbmpImage)
+	{
+		_userSized = true;
+		_refit();
+	}
+}
+
+BOOL MainDlg::OnGetMinMaxInfo(LPMINMAXINFO pMMI)
+{
+	// keep the window wide enough for the menu bar to fit on one line. _frameMargins is zero until OnInitDialog has run.
+	if (_frameMargins.cx == 0)
+		return FALSE;
+	pMMI->ptMinTrackSize.x = MIN_VIEW_CX + 2 * PHOTOMARGIN_CX + _frameMargins.cx;
+	pMMI->ptMinTrackSize.y = MIN_VIEW_CY + 2 * PHOTOMARGIN_CY + _frameMargins.cy;
+	return TRUE;
+}
+
+void MainDlg::OnEnterSizeMove()
+{
+	_inSizeMove = true;
+	_sizeBeforeMove = _vi.szPage;
+}
+
+void MainDlg::OnExitSizeMove()
+{
+	_inSizeMove = false;
+	// a plain move does not change the size. ignore it.
+	if (_vi.szPage.cx == _sizeBeforeMove.cx && _vi.szPage.cy == _sizeBeforeMove.cy)
+		return;
+	_userSized = true;
+	_refit();
 }
 
 BOOL MainDlg::OnMouseWheel(short nButtonType, short nWheelDelta, POINT pt)
@@ -948,6 +1027,23 @@ BOOL MainDlg::OnMouseWheel(short nButtonType, short nWheelDelta, POINT pt)
 
 BOOL MainDlg::OnMouseMove(UINT state, POINT pt)
 {
+	if (_panning)
+	{
+		// the button may have been released outside the window, or the capture lost to another window.
+		if (!(state & MK_LBUTTON) || GetCapture() != _hdlg)
+		{
+			_panning = false;
+			if (GetCapture() == _hdlg)
+				ReleaseCapture();
+			return FALSE;
+		}
+		// move the photo with the cursor. _layoutPage keeps it from being dragged past its edges.
+		_vi.ptPage.x = _panOrigin.x + pt.x - _panStart.x;
+		_vi.ptPage.y = _panOrigin.y + pt.y - _panStart.y;
+		_layoutPage();
+		InvalidateRect(_hdlg, NULL, FALSE);
+		return TRUE;
+	}
 	// report the mouse event to the viewinfo so it can make the scrollbars visible.
 	_vi.onMouseMove(_hdlg, state, pt);
 	return FALSE;
@@ -957,12 +1053,31 @@ BOOL MainDlg::OnLButtonDown(INT_PTR nButtonType, POINT pt)
 {
 	// if a sustained click-down occurs on a scrollbar, prepare to scroll the image. then, change the cursor shape to a hand with a pointing fingure.
 	if (_vi.startScroll(_hdlg, (UINT)nButtonType, pt))
+	{
 		SetCursor(LoadCursor(NULL, IDC_HAND));
+		return TRUE;
+	}
+	// anywhere else, drag the photo if it is larger than the window.
+	if (_hbmpImage && ((_vi.scrollH & VI_SCROLLER_VISIBLE) || (_vi.scrollV & VI_SCROLLER_VISIBLE)))
+	{
+		_panning = true;
+		_panStart = pt;
+		_panOrigin = _vi.ptPage;
+		SetCapture(_hdlg);
+		SetCursor(LoadCursor(NULL, IDC_SIZEALL));
+	}
 	return TRUE;
 }
 
 BOOL MainDlg::OnLButtonUp(INT_PTR nButtonType, POINT pt)
 {
+	if (_panning)
+	{
+		_panning = false;
+		ReleaseCapture();
+		SetCursor(LoadCursor(NULL, IDC_ARROW));
+		return TRUE;
+	}
 	// the click is over. stop the scrolling. switch back to the standard cursor.
 	if (_vi.stopScroll(_hdlg, (UINT)nButtonType, pt))
 		SetCursor(NULL);
