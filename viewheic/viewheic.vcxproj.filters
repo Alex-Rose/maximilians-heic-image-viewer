@@ -33,9 +33,6 @@
     <ClInclude Include="HeifImage.h">
       <Filter>Header Files</Filter>
     </ClInclude>
-    <ClInclude Include="ToolsDlg.h">
-      <Filter>Header Files</Filter>
-    </ClInclude>
     <ClInclude Include="CodecImage.h">
       <Filter>Header Files</Filter>
     </ClInclude>
@@ -83,30 +80,6 @@
       <Filter>Resource Files</Filter>
     </Image>
     <Image Include="res\app_s.ico">
-      <Filter>Resource Files</Filter>
-    </Image>
-    <Image Include="res\zoom.bmp">
-      <Filter>Resource Files</Filter>
-    </Image>
-    <Image Include="res\rotate.bmp">
-      <Filter>Resource Files</Filter>
-    </Image>
-    <Image Include="res\print.bmp">
-      <Filter>Resource Files</Filter>
-    </Image>
-    <Image Include="res\saveas.bmp">
-      <Filter>Resource Files</Filter>
-    </Image>
-    <Image Include="res\zoom.ico">
-      <Filter>Resource Files</Filter>
-    </Image>
-    <Image Include="res\print.ico">
-      <Filter>Resource Files</Filter>
-    </Image>
-    <Image Include="res\rotate.ico">
-      <Filter>Resource Files</Filter>
-    </Image>
-    <Image Include="res\saveas.ico">
       <Filter>Resource Files</Filter>
     </Image>
   </ItemGroup>

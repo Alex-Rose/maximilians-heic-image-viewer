@@ -52,6 +52,7 @@ public:
 		if (_hdlg)
 			::DestroyWindow(_hdlg);
 	}
+	HWND GetHwnd() const { return _hdlg; }
 	INT_PTR DoModal()
 	{
 		return DialogBoxParam(

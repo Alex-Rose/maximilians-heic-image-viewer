@@ -45,6 +45,8 @@ public:
 	char _imagePath[_MAX_PATH];
 	struct heif_context* _ctx;
 	struct heif_image_handle* _imageHandle;
+	// the full-scale image decoded by the first call to decode(). zooming rescales it instead of decoding the file again.
+	struct heif_image* _decoded;
 	SIZE _imageSize;
 	int _imageCount;
 

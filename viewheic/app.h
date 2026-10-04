@@ -25,8 +25,6 @@
 
 // viewer option flags for ViewFlags in registry key [HKCR\SOFTWARE\mtanabe\heicviewer].
 #define VIEWHEIC_SAVE_NO_EXIF 0x00000001
-#define VIEWHEIC_ALWAYS_CENTER_TOOLBAR 0x00010000
-#define VIEWHEIC_TEXT_LABEL_ON_TOOLBAR 0x00020000
 
 // subkey of the app, applicable to both HKLM and HLCR
 #define APPREGKEY L"SOFTWARE\\mtanabe\\heicviewer"

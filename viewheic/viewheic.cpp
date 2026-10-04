@@ -27,6 +27,8 @@
 #include "viewheic.h"
 #include "app.h"
 #include "AboutDlg.h"
+#include <shlwapi.h> // StrCmpLogicalW
+#include <algorithm>
 
 
 // this embeds a manifest for using v6 common controls of win32.
@@ -75,8 +77,21 @@ int APIENTRY wWinMain(_In_ HINSTANCE hInstance,
 		return convertHeifToJpeg(args[0].c_str(), args[1].c_str());
 	}
 
+	// run the viewer as a modeless dialog with our own message loop. a modal dialog box would not let us use the keyboard accelerators.
 	MainDlg dlg(args[0]);
-	dlg.DoModal();
+	if (!dlg.Create())
+		return GetLastError();
+	ShowWindow(dlg.GetHwnd(), nCmdShow);
+	HACCEL haccel = LoadAccelerators(hInstance, MAKEINTRESOURCE(IDR_MAINFRAME));
+	MSG msg;
+	while (GetMessage(&msg, NULL, 0, 0) > 0)
+	{
+		HWND hwnd = dlg.GetHwnd();
+		if (hwnd && (TranslateAccelerator(hwnd, haccel, &msg) || IsDialogMessage(hwnd, &msg)))
+			continue;
+		TranslateMessage(&msg);
+		DispatchMessage(&msg);
+	}
 	return ERROR_SUCCESS;
 }
 
@@ -395,23 +410,16 @@ BOOL MainDlg::OnInitDialog()
 	SendMessage(_hdlg, WM_SETICON, ICON_BIG, (LPARAM)hicon);
 	hicon = LoadIcon(AppInstanceHandle, MAKEINTRESOURCE(IDI_APP_SMALL));
 	SendMessage(_hdlg, WM_SETICON, ICON_SMALL, (ULONG_PTR)hicon);
-	// add 'about this app' menu command to the system menu.
-	HMENU hsysmenu = GetSystemMenu(_hdlg, FALSE);
-	if (hsysmenu)
-	{
-		InsertMenu(hsysmenu, -1, MF_BYPOSITION | MF_SEPARATOR, 0, NULL);
-		InsertMenu(hsysmenu, -1, MF_BYPOSITION | MF_STRING, IDM_ABOUT, (LPCWSTR)resstring(AppInstanceHandle, IDS_ABOUT_APP));
-	}
 
 	// load optional settings from the user's registry.
 	DWORD val;
 	if (ERROR_SUCCESS == Registry_GetDwordValue(HKEY_CURRENT_USER, APPREGKEY, L"ViewFlags", &val))
 		_heifFlags = val;
-	// create the toolbar as a modeless dialog.
-	_tools = new ToolsDlg(_hdlg, _heifFlags & VIEWHEIC_ALWAYS_CENTER_TOOLBAR, _heifFlags & VIEWHEIC_TEXT_LABEL_ON_TOOLBAR);
-	_tools->Create();
 
-	// find the margins, the difference between the window frame and the image display area.
+	// the area around a photo smaller than the window is painted in this color.
+	_hbrBack = CreateSolidBrush(RGB(32, 32, 32));
+
+	// find the margins, the difference between the window frame and the image display area. they include the menu bar.
 	RECT rcFrame, rcClient;
 	GetWindowRect(_hdlg, &rcFrame);
 	GetClientRect(_hdlg, &rcClient);
@@ -419,25 +427,37 @@ BOOL MainDlg::OnInitDialog()
 	_frameMargins.cy = rcFrame.bottom - rcFrame.top - rcClient.bottom;
 
 	// if an image filename has been given, open it and display the image. otherwise, run a file browse dialog and let the user choose an image to show.
-	if (_filename.empty())
+	if (_nextFilename.empty())
 		PostMessage(_hdlg, WM_COMMAND, MAKEWPARAM(IDM_OPEN, 0), 0);
 	else
-		PostMessage(_hdlg, WM_COMMAND, MAKEWPARAM(IDM_DECODE, 0), 0);
+		_openFile(_nextFilename);
+	return TRUE;
+}
+
+BOOL MainDlg::OnOK()
+{
+	// the dialog manager sends IDOK for the Enter key. there is nothing to confirm in a viewer.
+	return TRUE;
+}
+
+BOOL MainDlg::OnCancel()
+{
+	// Esc, the close button and File > Exit end up here. we are modeless, so destroy the window instead of calling EndDialog.
+	DestroyWindow(_hdlg);
 	return TRUE;
 }
 
 void MainDlg::OnDestroy()
 {
-	if (_tools)
-	{
-		_tools->Destroy();
-		delete _tools;
-	}
 	if (_heif)
 		delete _heif;
 	if (_hbmpImage)
 		DeleteObject(_hbmpImage);
+	if (_hbrBack)
+		DeleteObject(_hbrBack);
 	SimpleDlg::OnDestroy();
+	// the main window is gone. end the message loop in wWinMain.
+	PostQuitMessage(0);
 }
 
 void MainDlg::_setCaption(ULONG flags)
@@ -461,16 +481,28 @@ void MainDlg::_setCaption(ULONG flags)
 		resstring rotationAngle(resstring(AppInstanceHandle, IDS_ROTATION_ANGLE_FMT), deg);
 		c += rotationAngle;
 	}
-	if (_vi.zoomRatio && ((flags & 1) || (_vi.zoomRatio != 100)))
+	if (_heif && _vi.zoomRatio && ((flags & 1) || (_vi.zoomRatio != 100)))
 	{
 		resstring percentZoom(L" (%d%%)", _vi.zoomRatio);
 		c += percentZoom;
+	}
+	// show where the photo is among the photos of its folder.
+	if (_photoIndex && _photoCount > 1)
+	{
+		resstring position(L"  \x00B7  %d / %d", _photoIndex, _photoCount);
+		c += position;
 	}
 	SetWindowText(_hdlg, c.c_str());
 }
 
 void MainDlg::_autoZoom(bool syncParams)
 {
+	// the largest image area that fits on the monitor, after the window frame and the menu bar.
+	MONITORINFO mi = { sizeof(mi) };
+	GetMonitorInfo(MonitorFromWindow(_hdlg, MONITOR_DEFAULTTONEAREST), &mi);
+	_vi.szScreen.cx = mi.rcWork.right - mi.rcWork.left - _frameMargins.cx;
+	_vi.szScreen.cy = mi.rcWork.bottom - mi.rcWork.top - _frameMargins.cy;
+
 	SIZE szView;
 	int zoom = 0;
 	if (_heif->_imageSize.cx > _vi.szScreen.cx || _heif->_imageSize.cy > _vi.szScreen.cy)
@@ -503,25 +535,235 @@ void MainDlg::_autoZoom(bool syncParams)
 	_sizeWindow(szView);
 }
 
+// the smallest image area. it keeps the window wide enough for the menu bar to fit on one line.
+#define MIN_VIEW_CX 400
+#define MIN_VIEW_CY 240
+
 void MainDlg::_sizeWindow(SIZE viewSize)
 {
+	if (viewSize.cx < MIN_VIEW_CX)
+		viewSize.cx = MIN_VIEW_CX;
+	if (viewSize.cy < MIN_VIEW_CY)
+		viewSize.cy = MIN_VIEW_CY;
 	SIZE szDlg = { viewSize.cx + 2 * PHOTOMARGIN_CX + _frameMargins.cx, viewSize.cy + 2 * PHOTOMARGIN_CY + _frameMargins.cy };
-	SetWindowPos(_hdlg, NULL, 0, 0, szDlg.cx, szDlg.cy, SWP_NOMOVE | SWP_NOZORDER);
+	// keep the window on its monitor. the next photo may be taller and would otherwise extend past the bottom of the screen.
+	RECT rc;
+	GetWindowRect(_hdlg, &rc);
+	MONITORINFO mi = { sizeof(mi) };
+	GetMonitorInfo(MonitorFromWindow(_hdlg, MONITOR_DEFAULTTONEAREST), &mi);
+	POINT pos = { rc.left, rc.top };
+	if (pos.x + szDlg.cx > mi.rcWork.right)
+		pos.x = mi.rcWork.right - szDlg.cx;
+	if (pos.y + szDlg.cy > mi.rcWork.bottom)
+		pos.y = mi.rcWork.bottom - szDlg.cy;
+	if (pos.x < mi.rcWork.left)
+		pos.x = mi.rcWork.left;
+	if (pos.y < mi.rcWork.top)
+		pos.y = mi.rcWork.top;
+	SetWindowPos(_hdlg, NULL, pos.x, pos.y, szDlg.cx, szDlg.cy, SWP_NOZORDER | SWP_NOACTIVATE);
+	// WM_SIZE does not arrive if the size has not changed. so, update the page here too.
+	GetClientRect(_hdlg, &rc);
+	_vi.szPage = { rc.right - 2 * PHOTOMARGIN_CX, rc.bottom - 2 * PHOTOMARGIN_CY };
+	_layoutPage();
 }
 
-BOOL MainDlg::OnSysCommand(WPARAM wp_, LPARAM lp_)
+// centers the image if it is smaller than the page. otherwise, keeps the scroll position in range and shows the scrollers.
+void MainDlg::_layoutPage()
 {
-	if ((wp_ & 0xF000) == 0)
+	if (_vi.szImage.cx <= _vi.szPage.cx)
 	{
-		// not a system menu command. see if it's one of ours.
-		if (wp_ == IDM_ABOUT)
-		{
-			// let our regular handler respond to it.
-			PostMessage(_hdlg, WM_COMMAND, wp_ & 0x00000FFF, 0);
-			return TRUE;
-		}
+		_vi.ptPage.x = (_vi.szPage.cx - _vi.szImage.cx) / 2;
+		_vi.scrollH &= ~VI_SCROLLER_VISIBLE;
 	}
-	return SimpleDlg::OnSysCommand(wp_, lp_);
+	else
+	{
+		if (_vi.ptPage.x > 0)
+			_vi.ptPage.x = 0;
+		else if (_vi.ptPage.x < _vi.szPage.cx - _vi.szImage.cx)
+			_vi.ptPage.x = _vi.szPage.cx - _vi.szImage.cx;
+		_vi.scrollH |= VI_SCROLLER_VISIBLE;
+	}
+	if (_vi.szImage.cy <= _vi.szPage.cy)
+	{
+		_vi.ptPage.y = (_vi.szPage.cy - _vi.szImage.cy) / 2;
+		_vi.scrollV &= ~VI_SCROLLER_VISIBLE;
+	}
+	else
+	{
+		if (_vi.ptPage.y > 0)
+			_vi.ptPage.y = 0;
+		else if (_vi.ptPage.y < _vi.szPage.cy - _vi.szImage.cy)
+			_vi.ptPage.y = _vi.szPage.cy - _vi.szImage.cy;
+		_vi.scrollV |= VI_SCROLLER_VISIBLE;
+	}
+}
+
+POINT MainDlg::_pageCenter()
+{
+	return { _vi.szPage.cx / 2, _vi.szPage.cy / 2 };
+}
+
+// the zoom ratio at which the whole image fits in the window. it is never more than 100 percent.
+int MainDlg::_fitZoom()
+{
+	SIZE sz = _heif->_imageSize;
+	if (_heif->_data.rotated & 1)
+		std::swap(sz.cx, sz.cy);
+	if (sz.cx <= 0 || sz.cy <= 0)
+		return 100;
+	// round down so that the image does not overflow the window by a pixel.
+	int zx = (int)((LONGLONG)100 * _vi.szPage.cx / sz.cx);
+	int zy = (int)((LONGLONG)100 * _vi.szPage.cy / sz.cy);
+	int z = zx < zy ? zx : zy;
+	if (z > 100)
+		z = 100;
+	return z < 1 ? 1 : z;
+}
+
+// zoom steps used by zoom in and out. the ratio that fits the window is added as one more step.
+static const int ZoomSteps[] = { 10, 15, 20, 25, 33, 50, 67, 75, 100, 125, 150, 200 };
+
+void MainDlg::_stepZoom(int steps, POINT anchor)
+{
+	if (!_heif || !_hbmpImage)
+		return;
+	int fit = _fitZoom();
+	int ratio = _vi.zoomRatio;
+	for (; steps > 0; steps--)
+	{
+		// the smallest step above the current ratio.
+		int next = (fit > ratio) ? fit : INT_MAX;
+		for (int z : ZoomSteps)
+			if (z > ratio && z < next)
+				next = z;
+		if (next == INT_MAX)
+			break;
+		ratio = next;
+	}
+	for (; steps < 0; steps++)
+	{
+		// the largest step below the current ratio.
+		int prev = (fit < ratio) ? fit : 0;
+		for (int z : ZoomSteps)
+			if (z < ratio && z > prev)
+				prev = z;
+		if (prev == 0)
+			break;
+		ratio = prev;
+	}
+	_setZoom(ratio, anchor);
+}
+
+// rescales the image to ratio percent of its full size. the image point under anchor stays where it is.
+void MainDlg::_setZoom(int ratio, POINT anchor)
+{
+	if (!_heif || !_hbmpImage || ratio == _vi.zoomRatio)
+		return;
+	SetCursor(LoadCursor(NULL, IDC_WAIT));
+	// find where the anchor is on the image, as a fraction of the image extents.
+	double fx = _vi.szImage.cx ? (double)(anchor.x - _vi.ptPage.x) / _vi.szImage.cx : 0.5;
+	double fy = _vi.szImage.cy ? (double)(anchor.y - _vi.ptPage.y) / _vi.szImage.cy : 0.5;
+	DeleteObject(_hbmpImage);
+	// zoom keeps the rotation, and reports the extents of the new bitmap in szImage.
+	_hbmpImage = _heif->zoom(ratio, _vi.szImage);
+	_vi.zoomRatio = ratio;
+	_vi.ptPage.x = anchor.x - (int)(fx * _vi.szImage.cx);
+	_vi.ptPage.y = anchor.y - (int)(fy * _vi.szImage.cy);
+	_layoutPage();
+	_setCaption(1);
+	SetCursor(NULL);
+	InvalidateRect(_hdlg, NULL, FALSE);
+}
+
+// asks IDM_DECODE to open the photo at path.
+void MainDlg::_openFile(const std::wstring &path)
+{
+	// use the full path. finding the next photo needs the folder, and the command line may have given a relative path.
+	DWORD cc = GetFullPathName(path.c_str(), 0, NULL, NULL);
+	if (cc)
+	{
+		std::wstring full(cc, 0);
+		cc = GetFullPathName(path.c_str(), cc, &full[0], NULL);
+		full.resize(cc);
+		_nextFilename = full;
+	}
+	else
+		_nextFilename = path;
+	PostMessage(_hdlg, WM_COMMAND, MAKEWPARAM(IDM_DECODE, 0), 0);
+}
+
+// lists the heic photos in folder, sorted the way Explorer sorts file names.
+static void _listPhotos(const std::wstring &folder, std::vector<std::wstring> &names)
+{
+	WIN32_FIND_DATA fd;
+	HANDLE hf = FindFirstFileEx((folder + L"*").c_str(), FindExInfoBasic, &fd, FindExSearchNameMatch, NULL, FIND_FIRST_EX_LARGE_FETCH);
+	if (hf == INVALID_HANDLE_VALUE)
+		return;
+	do
+	{
+		if (fd.dwFileAttributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_HIDDEN))
+			continue;
+		LPCWSTR extension = wcsrchr(fd.cFileName, '.');
+		if (extension && (0 == _wcsicmp(extension, L".heic") || 0 == _wcsicmp(extension, L".heif")))
+			names.push_back(fd.cFileName);
+	} while (FindNextFile(hf, &fd));
+	FindClose(hf);
+	std::sort(names.begin(), names.end(), [](const std::wstring &a, const std::wstring &b) { return StrCmpLogicalW(a.c_str(), b.c_str()) < 0; });
+}
+
+// finds the position of the current photo in its folder for the caption.
+void MainDlg::_updatePhotoPosition()
+{
+	_photoIndex = _photoCount = 0;
+	LPCWSTR title = GetFileTitlePtr(_filename.c_str());
+	std::vector<std::wstring> names;
+	_listPhotos(std::wstring(_filename.c_str(), title - _filename.c_str()), names);
+	for (size_t i = 0; i < names.size(); i++)
+	{
+		if (0 == _wcsicmp(names[i].c_str(), title))
+			_photoIndex = (int)i + 1;
+	}
+	_photoCount = (int)names.size();
+}
+
+// opens the photo step positions after (or, if step is negative, before) the current one in the same folder.
+void MainDlg::_openSibling(int step)
+{
+	if (_filename.empty())
+		return;
+	// holding an arrow key queues key repeats while a photo decodes. fold them into this step, so that the viewer stops flipping when the key is released.
+	MSG msg;
+	while (PeekMessage(&msg, _hdlg, WM_KEYDOWN, WM_KEYDOWN, PM_NOREMOVE) && (msg.wParam == VK_LEFT || msg.wParam == VK_RIGHT))
+	{
+		PeekMessage(&msg, _hdlg, WM_KEYDOWN, WM_KEYDOWN, PM_REMOVE);
+		step += (msg.wParam == VK_RIGHT) ? 1 : -1;
+	}
+	if (step == 0)
+		return;
+	// list the folder again. photos may have been added, renamed or deleted since the last look.
+	LPCWSTR title = GetFileTitlePtr(_filename.c_str());
+	std::wstring folder(_filename.c_str(), title - _filename.c_str());
+	std::vector<std::wstring> names;
+	_listPhotos(folder, names);
+	// find where the current photo sorts. this works even if it is no longer in the folder.
+	int count = (int)names.size();
+	int i = 0;
+	while (i < count && StrCmpLogicalW(names[i].c_str(), title) < 0)
+		i++;
+	bool found = i < count && 0 == _wcsicmp(names[i].c_str(), title);
+	// if the current photo is gone, names[i] is the photo after it. one step forward is then names[i] itself.
+	int target = i + step - ((!found && step > 0) ? 1 : 0);
+	if (target < 0)
+		target = 0;
+	if (target >= count)
+		target = count - 1;
+	if (target < 0 || (found && target == i))
+	{
+		// already at the first or the last photo.
+		MessageBeep(MB_OK);
+		return;
+	}
+	_openFile(folder + names[target]);
 }
 
 BOOL MainDlg::OnCommand(WPARAM wp_, LPARAM lp_)
@@ -531,48 +773,93 @@ BOOL MainDlg::OnCommand(WPARAM wp_, LPARAM lp_)
 	case IDM_DECODE:
 		if (lp_ == 0)
 		{
-			_setCaption();
-
 			HeifImage *h = new HeifImage();
-			if (h->init(_hdlg, _filename.c_str(), _heifFlags))
+			if (h->init(_hdlg, _nextFilename.c_str(), _heifFlags))
 			{
 				if (_heif)
 					delete _heif;
 				_heif = h;
+				_filename = _nextFilename;
+				_updatePhotoPosition();
 				_autoZoom(true);
+				_setCaption();
 				PostMessage(_hdlg, WM_COMMAND, MAKEWPARAM(IDM_DECODE, 0), 1);
 			}
 			else
 			{
 				delete h;
-				EndDialog(_hdlg, IDABORT); // quit since the file could not be opened.
+				// init has reported the error. quit if this was the first photo. otherwise, show the name of the photo that failed on an empty page, so that the arrow keys can move past it.
+				if (_filename.empty())
+				{
+					DestroyWindow(_hdlg);
+					return TRUE;
+				}
+				if (_heif)
+				{
+					delete _heif;
+					_heif = NULL;
+				}
+				if (_hbmpImage)
+				{
+					DeleteObject(_hbmpImage);
+					_hbmpImage = NULL;
+				}
+				_filename = _nextFilename;
+				_vi.szImage = { 0 };
+				_vi.zoomRatio = 0;
+				_layoutPage();
+				_updatePhotoPosition();
+				_setCaption();
+				InvalidateRect(_hdlg, NULL, FALSE);
 			}
 		}
-		else if (lp_ == 1)
+		else if (lp_ == 1 && _heif)
 		{
 			SetCursor(LoadCursor(NULL, IDC_WAIT));
 			if (_hbmpImage)
 				DeleteObject(_hbmpImage);
 			_hbmpImage = _heif->decode(_vi.szImage);
+			// the decoder reports the extents of the bitmap it actually made.
+			_vi.szImage = _heif->_data.dims;
+			_layoutPage();
 			SetCursor(NULL);
-			InvalidateRect(_hdlg, NULL, TRUE);
+			InvalidateRect(_hdlg, NULL, FALSE);
 		}
 		return TRUE;
 	case IDM_OPEN:
 		OnButtonOpen();
 		return TRUE;
-
-	case IDC_BUTTON_ROTATE:
-		OnButtonRotate();
-		return TRUE;
-	case IDC_BUTTON_ZOOM:
-		OnButtonZoom();
-		return TRUE;
-	case IDC_BUTTON_SAVEAS:
+	case IDM_SAVEAS:
 		OnButtonSaveAs();
 		return TRUE;
-	case IDC_BUTTON_PRINT:
+	case IDM_PRINT:
 		OnButtonPrint();
+		return TRUE;
+	case IDM_EXIT:
+		DestroyWindow(_hdlg);
+		return TRUE;
+
+	case IDM_ZOOM_IN:
+		_stepZoom(1, _pageCenter());
+		return TRUE;
+	case IDM_ZOOM_OUT:
+		_stepZoom(-1, _pageCenter());
+		return TRUE;
+	case IDM_ZOOM_FIT:
+		if (_heif)
+			_setZoom(_fitZoom(), _pageCenter());
+		return TRUE;
+	case IDM_ZOOM_100:
+		_setZoom(100, _pageCenter());
+		return TRUE;
+	case IDM_ROTATE:
+		OnButtonRotate();
+		return TRUE;
+	case IDM_PREV:
+		_openSibling(-1);
+		return TRUE;
+	case IDM_NEXT:
+		_openSibling(1);
 		return TRUE;
 
 	case IDM_ABOUT:
@@ -587,7 +874,7 @@ BOOL MainDlg::OnCommand(WPARAM wp_, LPARAM lp_)
 
 void MainDlg::OnButtonRotate()
 {
-	if (!_heif)
+	if (!_heif || !_hbmpImage)
 		return;
 	// put up a wait cursor.
 	SetCursor(LoadCursor(NULL, IDC_WAIT));
@@ -610,112 +897,54 @@ void MainDlg::OnButtonRotate()
 	// ptPage.x is the distance from the left endpoint of the full image width and the starting point of the displayable width. it says how much of the image is pushed to the left of the viewport and so is hidden from view.
 	_vi.ptPage.x = (_vi.szPage.cx - _vi.szImage.cx) / 2;
 	_vi.ptPage.y = (_vi.szPage.cy - _vi.szImage.cy) / 2;
-	// determine if a scrollbar should be shown.
-	if (_vi.szPage.cx < _vi.szImage.cx)
-		_vi.scrollH |= VI_SCROLLER_VISIBLE;
-	else
-		_vi.scrollH &= ~VI_SCROLLER_VISIBLE;
-	if (_vi.szPage.cy < _vi.szImage.cy)
-		_vi.scrollV |= VI_SCROLLER_VISIBLE;
-	else
-		_vi.scrollV &= ~VI_SCROLLER_VISIBLE;
-	// correct the window size.
+	// correct the window size. this also lays out the page and shows the scrollers if needed.
 	_sizeWindow(_vi.szPage);
 	// print the new rotation angle next to the file name on the caption bar.
 	_setCaption();
 	// take out the wait cursor.
 	SetCursor(NULL);
 	// paint the rotated image in the updated viewport.
-	InvalidateRect(_hdlg, NULL, TRUE);
-	// don't want to keep the focus with the toolbar button. move it to the image window. this is needed for directing the mouse wheel to the image.
-	SetFocus(_hdlg);
-}
-
-void MainDlg::OnButtonZoom()
-{
-	if (!_heif)
-		return;
-	// show an hour glass.
-	SetCursor(LoadCursor(NULL, IDC_WAIT));
-	// if the image has been rotated, make sure the window or viewport is sized correctly.
-	if (_heif->_data.rotated)
-		_autoZoom();
-	// free the current bitmap.
-	if (_hbmpImage)
-		DeleteObject(_hbmpImage);
-	// find the next zoom ratio.
-	if (_vi.zoomRatio < 25)
-		_vi.zoomRatio = 25;
-	else if (_vi.zoomRatio < 50)
-		_vi.zoomRatio = 50;
-	else if (_vi.zoomRatio < 75)
-		_vi.zoomRatio = 75;
-	else if (_vi.zoomRatio < 100)
-		_vi.zoomRatio = 100;
-	else if (_vi.zoomRatio < 150)
-		_vi.zoomRatio = 150;
-	else if (_vi.zoomRatio < 200)
-		_vi.zoomRatio = 200;
-	else // back to the optimized size.
-		_vi.zoomRatio = _vi.zoomAuto;
-	// zoom the image.
-	_hbmpImage = _heif->zoom(_vi.zoomRatio, _vi.szImage);
-	// we keep the current window size. we won't change it even though we know the zoomed image must be larger. instead we will show the scrollbars.
-	// we're centering the image. calculate how much of it should go hidden past the left edge of the viewport.
-	_vi.ptPage.x = (_vi.szPage.cx - _vi.szImage.cx) / 2;
-	_vi.ptPage.y = (_vi.szPage.cy - _vi.szImage.cy) / 2;
-	// enable the scrollbars.
-	if (_vi.zoomRatio > _vi.zoomAuto)
-	{
-		_vi.scrollH |= VI_SCROLLER_VISIBLE;
-		_vi.scrollV |= VI_SCROLLER_VISIBLE;
-	}
-	else
-	{
-		_vi.scrollH &= ~VI_SCROLLER_VISIBLE;
-		_vi.scrollV &= ~VI_SCROLLER_VISIBLE;
-	}
-	// print the new percent zoom ratio on the caption bar.
-	_setCaption(1);
-	// stop the wait cursor.
-	SetCursor(NULL);
-	// paint the zoomed image.
-	InvalidateRect(_hdlg, NULL, TRUE);
-	// return the focus to the image window.
-	SetFocus(_hdlg);
-}
-
-void MainDlg::OnMove(int x, int y)
-{
-	// report the window move to the toolbar so the latter can relocate itself in sync.
-	if (_tools)
-		_tools->onParentMove({ x, y });
+	InvalidateRect(_hdlg, NULL, FALSE);
 }
 
 void MainDlg::OnSize(UINT nType, int cx, int cy)
 {
+	if (nType == SIZE_MINIMIZED)
+		return;
 	// keep the changed frame size.
 	_vi.szPage.cx = cx-2* PHOTOMARGIN_CX;
 	_vi.szPage.cy = cy-2* PHOTOMARGIN_CY;
-	// report the changed frame to the toolbar.
-	if (_tools)
-		_tools->onParentSize({ cx, cy });
+	_layoutPage();
 }
 
 BOOL MainDlg::OnMouseWheel(short nButtonType, short nWheelDelta, POINT pt)
 {
 	// the cursor position in pt is in screen coordinates. so, translate to dialog's client coords.
 	ScreenToClient(_hdlg, &pt);
+	if (nButtonType & MK_CONTROL)
+	{
+		// ctrl+wheel zooms around the cursor. take in the wheel messages already queued, so that a fast spin rescales the image only once.
+		int delta = nWheelDelta;
+		MSG msg;
+		while (PeekMessage(&msg, _hdlg, WM_MOUSEWHEEL, WM_MOUSEWHEEL, PM_NOREMOVE) && (GET_KEYSTATE_WPARAM(msg.wParam) & MK_CONTROL))
+		{
+			PeekMessage(&msg, _hdlg, WM_MOUSEWHEEL, WM_MOUSEWHEEL, PM_REMOVE);
+			delta += GET_WHEEL_DELTA_WPARAM(msg.wParam);
+		}
+		_wheelDelta += delta;
+		int steps = _wheelDelta / WHEEL_DELTA;
+		_wheelDelta -= steps * WHEEL_DELTA;
+		if (steps)
+			_stepZoom(steps, pt);
+		return TRUE;
+	}
 	if (_vi.onMouseWheel(nButtonType, nWheelDelta, pt))
-		InvalidateRect(_hdlg, NULL, TRUE);
+		InvalidateRect(_hdlg, NULL, FALSE);
 	return TRUE;
 }
 
 BOOL MainDlg::OnMouseMove(UINT state, POINT pt)
 {
-	// report the cursor motion to the toolbar which may need to bring the buttons out of the transpant state and make them visible.
-	if (_tools)
-		_tools->onParentMouseMove(state, pt);
 	// report the mouse event to the viewinfo so it can make the scrollbars visible.
 	_vi.onMouseMove(_hdlg, state, pt);
 	return FALSE;
@@ -757,6 +986,7 @@ BOOL MainDlg::OnPaint()
 	rc = { pt.x, pt.y + PHOTOMARGIN_CY + _vi.szImage.cy, pt.x + 2 * PHOTOMARGIN_CX + _vi.szImage.cx, pt.y + 2 * PHOTOMARGIN_CY + _vi.szImage.cy };
 	FillRect(ps.hdc, &rc, (HBRUSH)GetStockObject(WHITE_BRUSH));
 #endif//#if PHOTOMARGIN_CX > 0
+	RECT rcImage = { 0 };
 	if (_hbmpImage)
 	{
 		BITMAP bm;
@@ -770,10 +1000,18 @@ BOOL MainDlg::OnPaint()
 		BitBlt(ps.hdc, pt.x, pt.y, bm.bmWidth, bm.bmHeight, hdc2, 0, 0, SRCCOPY);
 		SelectObject(hdc2, hbmp0);
 		DeleteDC(hdc2);
-
-		// overlay the scrollbars if they should be visible.
-		_vi.drawScrollers(ps.hdc, SCROLLER_MORE_TRANSPARENT);
+		rcImage = { pt.x, pt.y, pt.x + bm.bmWidth, pt.y + bm.bmHeight };
 	}
+	// paint the part of the window the image does not cover. we skip the background erase, so it would show leftovers otherwise.
+	HRGN rgnBack = CreateRectRgnIndirect(&ps.rcPaint);
+	HRGN rgnImage = CreateRectRgnIndirect(&rcImage);
+	CombineRgn(rgnBack, rgnBack, rgnImage, RGN_DIFF);
+	FillRgn(ps.hdc, rgnBack, _hbrBack);
+	DeleteObject(rgnImage);
+	DeleteObject(rgnBack);
+	// overlay the scrollbars if they should be visible.
+	if (_hbmpImage)
+		_vi.drawScrollers(ps.hdc, SCROLLER_MORE_TRANSPARENT);
 
 	EndPaint(_hdlg, (LPPAINTSTRUCT)&ps);
 	return TRUE;
@@ -801,13 +1039,13 @@ void MainDlg::OnButtonOpen()
 		DWORD cderr = CommDlgExtendedError(); // CDERR_DIALOGFAILURE, etc.
 		if (cderr != 0) // 0 if user has canceled.
 			MessageBox(_hdlg, resstring(resstring(AppInstanceHandle, IDS_CDERR), cderr), resstring(AppInstanceHandle, IDS_APP_TITLE), MB_OK | MB_ICONEXCLAMATION);
-		// user canceled. we're shutting down.
-		PostMessage(_hdlg, WM_CLOSE, 0, 0);
+		// user canceled. if no photo has been opened yet, there is nothing to show. so, we're shutting down.
+		if (_filename.empty())
+			PostMessage(_hdlg, WM_CLOSE, 0, 0);
 		return;
 	}
-	// we have a hiec image. save its filename. then, issue a command to decode and display it.
-	_filename = path;
-	PostMessage(_hdlg, WM_COMMAND, MAKEWPARAM(IDM_DECODE, 0), 0);
+	// we have a hiec image. issue a command to decode and display it.
+	_openFile(path);
 }
 
 int MainDlg::_queryFileTitle(LPWSTR buf, int bufSize)
@@ -819,6 +1057,8 @@ int MainDlg::_queryFileTitle(LPWSTR buf, int bufSize)
 
 void MainDlg::OnButtonSaveAs()
 {
+	if (!_heif)
+		return;
 	WCHAR path[_MAX_PATH] = { 0 };
 	_queryFileTitle(path, ARRAYSIZE(path));
 
@@ -1007,6 +1247,8 @@ DWORD _printImage(PRINTDLGEX *pdx, HBITMAP _hbmpImage, HeifImage *heif)
 
 void MainDlg::OnButtonPrint()
 {
+	if (!_heif)
+		return;
 	HRESULT hr;
 	PRINTDLGEX *pdx = (PRINTDLGEX*)GlobalAlloc(LPTR, sizeof(PRINTDLGEX));
 	pdx->lStructSize = sizeof(PRINTDLGEX);
