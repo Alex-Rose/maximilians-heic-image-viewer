@@ -186,7 +186,15 @@ HBITMAP HeifImage::decode(SIZE viewSize)
 		MessageBoxA(_hwnd, "Unexpected NULL pointer received", "heif_image_get_plane_readonly", MB_OK);
 		return NULL;
 	}
-	ASSERT(srcStride / destSize.cx == sizeof(RGBTRIPLE));
+	// copy only as many pixels as the decoded plane actually has. the size declared by the file may differ from it.
+	destSize.cx = heif_image_get_width(image, heif_channel_interleaved);
+	destSize.cy = heif_image_get_height(image, heif_channel_interleaved);
+	if (destSize.cx <= 0 || destSize.cy <= 0 || srcStride < destSize.cx * (int)sizeof(RGBTRIPLE))
+	{
+		heif_image_release(image);
+		MessageBoxA(_hwnd, "Decoded image has an unexpected size", "heif_image_get_plane_readonly", MB_OK);
+		return NULL;
+	}
 
 	HDC hdc0 = GetDC(_hwnd);
 	HDC hdc = CreateCompatibleDC(hdc0);
@@ -426,7 +434,7 @@ void _rotateImage(HeifImage::DecodedImageData &src, RGBQUAD *dest)
 HBITMAP HeifImage::rotate(SIZE &newSize)
 {
 	if (!_data.bits)
-		return false; // make sure decode is called before you use rotate.
+		return NULL; // make sure decode is called before you use rotate.
 
 	// swap the image width and height if this is an even-numbered call. if this is the first rotation, the original top and bottom become right and left sides.
 	SIZE destSize = _data.dims;
@@ -616,6 +624,9 @@ struct APP1_EXIF {
 
 bool HeifImage::_parseExif(std::vector<BYTE> &metadata)
 {
+	// the block must be large enough to hold the 4-byte prefix, the 'Exif' signature and the tiff header.
+	if (metadata.size() < 4 + FIELD_OFFSET(APP1_EXIF, IFD0))
+		return false;
 	// skip the first 4 bytes to get to the exif/tiff header.
 	LPBYTE p0 = metadata.data()+4;
 	int len0 = (int)metadata.size()-4;
@@ -633,12 +644,15 @@ bool HeifImage::_parseExif(std::vector<BYTE> &metadata)
 		return false;
 	_ifd.push_back(ifd0);
 	// the offset to another IFD (called IFD1) immediately follows IFD0. it contains a thumbnail image.
-	ULONG offsetIfd1 = ifd0.getULONG(ifd0._basePtr+ifd0._offset+len);
+	ULONG offsetIfd1 = 0;
+	if (ifd0._offset + len + (int)sizeof(ULONG) <= ifd0._baseLen)
+		offsetIfd1 = ifd0.getULONG(ifd0._basePtr+ifd0._offset+len);
 	// IFD0 includes an offset to a sub-IFD called 'Exif IFD'. it holds image configuration info.
+	// use _getIntValueOf to read the offsets. it checks that the attribute has data to read.
 	const ExifIfdAttribute *offsetToIfd = ifd0.find(ExifIfdAttribute::OffsetToExifIFD);
 	if (offsetToIfd)
 	{
-		ULONG offsetExifIfd = ifd0.getULONG((LPVOID)offsetToIfd->_value.data());
+		ULONG offsetExifIfd = ifd0._getIntValueOf(offsetToIfd);
 		ExifIfd ifdExif(EXIFIFDCLASS_EXIF, ifd0._basePtr, ifd0._baseLen, ifd0._big);
 		len = ifdExif.parse(offsetExifIfd);
 		_ifd.push_back(ifdExif);
@@ -647,7 +661,7 @@ bool HeifImage::_parseExif(std::vector<BYTE> &metadata)
 	offsetToIfd = ifd0.find(ExifIfdAttribute::OffsetToGpsIFD);
 	if (offsetToIfd)
 	{
-		ULONG offsetGpsIfd = ifd0.getULONG((LPVOID)offsetToIfd->_value.data());
+		ULONG offsetGpsIfd = ifd0._getIntValueOf(offsetToIfd);
 		ExifIfd ifdGps(EXIFIFDCLASS_GPS, ifd0._basePtr, ifd0._baseLen, ifd0._big);
 		len = ifdGps.parse(offsetGpsIfd);
 		_ifd.push_back(ifdGps);

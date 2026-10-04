@@ -166,22 +166,26 @@ LPCSTR ExifIfdAttribute::_IfdTagName()
 	return tagname;
 }
 
+// returns 0 if the attribute's value does not lie within the metadata. the caller should skip such an attribute.
 int ExifIfdAttribute::parse()
 {
 	LPBYTE p;
-	int valLen = _ifd.Count*_coll->_getDataUnitLength((EXIF_IFD_DATATYPE)_ifd.Type);
+	// Count comes from the file. compute the length in 64 bits so that a huge count cannot wrap around to a small length.
+	ULONGLONG valLen = (ULONGLONG)_ifd.Count * (ULONGLONG)_coll->_getDataUnitLength((EXIF_IFD_DATATYPE)_ifd.Type);
 	if (valLen <= 4)
 	{
 		p = (LPBYTE)&_ifd.ValueOrOffset;
-		_value.resize(valLen);
-		memcpy(_value.data(), p, valLen);
+		_value.resize((size_t)valLen);
+		memcpy(_value.data(), p, (size_t)valLen);
 	}
 	else
 	{
 		_ifd.ValueOrOffset = _coll->getULONG(&_ifd.ValueOrOffset);
+		if ((ULONGLONG)_ifd.ValueOrOffset + valLen > (ULONGLONG)_coll->_baseLen)
+			return 0;
 		p = _coll->_basePtr + _ifd.ValueOrOffset;
-		_value.resize(valLen);
-		memcpy(_value.data(), p, valLen);
+		_value.resize((size_t)valLen);
+		memcpy(_value.data(), p, (size_t)valLen);
 		// save the value offset. MetaJpegScan will be use it to create a region in gray that's associated with this ifd attribute entry.
 		_valueOffset = (int)_ifd.ValueOrOffset;
 	}
@@ -219,11 +223,13 @@ HRESULT PropVariant::assignIfdValue(ExifIfdAttribute &attrib)
 		hr = InitPropVariantFromBuffer(val_.data(), (UINT)val_.size(), this);
 		break;
 	case IFD_ASCII:
-		this->vt = VT_LPSTR;
-		this->pszVal = (LPSTR)CoTaskMemAlloc(val_.size());
+		// the string in the file may not be null-terminated. add a terminator.
+		this->pszVal = (LPSTR)CoTaskMemAlloc(val_.size() + 1);
 		if (!this->pszVal)
 			return E_OUTOFMEMORY;
+		this->vt = VT_LPSTR;
 		memcpy(this->pszVal, val_.data(), val_.size());
+		this->pszVal[val_.size()] = 0;
 		break;
 	case IFD_BYTE: // VT_UI1 | VT_VECTOR
 		if (ifd_.Count == 1)
@@ -233,10 +239,12 @@ HRESULT PropVariant::assignIfdValue(ExifIfdAttribute &attrib)
 		}
 		else
 		{
+			this->caub.pElems = (UCHAR*)CoTaskMemAlloc(val_.size());
+			if (!this->caub.pElems)
+				return E_OUTOFMEMORY;
 			this->vt |= VT_VECTOR | VT_UI1;
 			this->caub.cElems = ifd_.Count;
-			this->caub.pElems = (UCHAR*)CoTaskMemAlloc(val_.size());
-			memcpy(this->caub.pElems, val_.data(), ifd_.Count);
+			memcpy(this->caub.pElems, val_.data(), val_.size());
 		}
 		break;
 	case IFD_CHAR:
@@ -247,10 +255,12 @@ HRESULT PropVariant::assignIfdValue(ExifIfdAttribute &attrib)
 		}
 		else
 		{
+			this->cac.pElems = (CHAR*)CoTaskMemAlloc(val_.size());
+			if (!this->cac.pElems)
+				return E_OUTOFMEMORY;
 			this->vt |= VT_VECTOR | VT_I1;
 			this->cac.cElems = ifd_.Count;
-			this->cac.pElems = (CHAR*)CoTaskMemAlloc(val_.size());
-			memcpy(this->cac.pElems, val_.data(), ifd_.Count);
+			memcpy(this->cac.pElems, val_.data(), val_.size());
 		}
 		break;
 	case IFD_USHORT:
@@ -354,9 +364,11 @@ HRESULT PropVariant::assignIfdValue(ExifIfdAttribute &attrib)
 		else
 		{
 			// unfortunately, there is no InitPropVariantFromFloatVector...
+			this->caflt.pElems = (FLOAT*)CoTaskMemAlloc(val_.size());
+			if (!this->caflt.pElems)
+				return E_OUTOFMEMORY;
 			this->vt |= VT_VECTOR | VT_R4;
 			this->caflt.cElems = ifd_.Count;
-			this->caflt.pElems = (FLOAT*)CoTaskMemAlloc(ifd_.Count * sizeof(FLOAT));
 			FLOAT *d = (FLOAT*)val_.data();
 			for (UINT i = 0; i < ifd_.Count; i++)
 				this->caflt.pElems[i] = emd_->getFLOAT(d++);
@@ -387,11 +399,17 @@ HRESULT PropVariant::assignIfdValue(ExifIfdAttribute &attrib)
 ///////////////////////////////////
 
 
+// returns 0 if the directory does not lie within the metadata.
 int ExifIfd::parse(int dataOffset)
 {
+	// dataOffset comes from the file. make sure the tag count and every directory entry are inside the metadata.
+	if (dataOffset < 0 || dataOffset > _baseLen - (int)sizeof(USHORT))
+		return 0;
 	LPBYTE src = _basePtr + dataOffset;
 	int len, usedLen = sizeof(USHORT);
 	USHORT i, tagCount = getUSHORT(src);
+	if (tagCount > (_baseLen - dataOffset - (int)sizeof(USHORT)) / (int)sizeof(EXIF_IFD))
+		tagCount = (USHORT)((_baseLen - dataOffset - (int)sizeof(USHORT)) / (int)sizeof(EXIF_IFD));
 	LPBYTE p = src + sizeof(tagCount);
 	int endingOffset = 0, nextEnding;
 	for (i = 0; i < tagCount; i++)
@@ -399,9 +417,11 @@ int ExifIfd::parse(int dataOffset)
 		ExifIfdAttribute next((EXIF_IFD*)p, this);
 		// note that len does not include the data bytes.
 		len = next.parse();
+		usedLen += sizeof(EXIF_IFD);
+		p += sizeof(EXIF_IFD);
+		if (len == 0)
+			continue; // the attribute's value lies outside the metadata. skip it.
 		push_back(next);
-		usedLen += len;
-		p += len;
 		nextEnding = next._valueOffset + (int)next._value.size();
 		if (nextEnding > endingOffset)
 			endingOffset = nextEnding;
@@ -454,13 +474,17 @@ int ExifIfd::_getDataUnitLength(EXIF_IFD_DATATYPE dtype) const
 ULONG ExifIfd::_getIntValueOf(const ExifIfdAttribute *attrib) const
 {
 	ULONG ret = 0;
+	// a value with a count of 0 has no data to read.
+	if (attrib->_value.size() < (size_t)_getDataUnitLength((EXIF_IFD_DATATYPE)attrib->_ifd.Type))
+		return 0;
 	switch (attrib->_ifd.Type)
 	{
 	case IFD_BYTE:
 	case IFD_ASCII:
 	case IFD_CHAR:
 	case IFD_UNDEFINED:
-		ret = std::stoi(_getStrValueOf(attrib));
+		// use strtoul, not std::stoi. stoi throws if the text is not a number.
+		ret = strtoul(_getStrValueOf(attrib).c_str(), NULL, 10);
 		break;
 	case IFD_FLOAT:
 		ret = (ULONG)(LONG)getFLOAT((LPVOID)attrib->_value.data());
@@ -496,6 +520,9 @@ std::string ExifIfd::_getStrValueOf(const ExifIfdAttribute *attrib) const
 		ret.assign(attrib->_value.begin(), attrib->_value.end());
 		return ret;
 	}
+	// a value with a count of 0 has no data to read.
+	if (attrib->_value.size() < (size_t)_getDataUnitLength((EXIF_IFD_DATATYPE)attrib->_ifd.Type))
+		return ret;
 
 	char buf[128] = { 0 };
 	switch (attrib->_ifd.Type)

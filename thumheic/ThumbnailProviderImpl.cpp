@@ -57,27 +57,33 @@ STDMETHODIMP ThumbnailProviderImpl::Initialize(/* [annotation][in] */_In_  IStre
 STDMETHODIMP ThumbnailProviderImpl::GetThumbnail(/* [in] */ UINT cx, /* [out] */ __RPC__deref_out_opt HBITMAP *phbmp, /* [out] */ __RPC__out WTS_ALPHATYPE *pdwAlpha)
 {
 	DBGPRINTF((L"ThumbnailProviderImpl::GetThumbnail started: CX=%d", cx));
+	if (!phbmp || !pdwAlpha)
+		return E_POINTER;
+	*phbmp = NULL;
+	if (!_ctx || !_reader)
+		return E_UNEXPECTED; // Initialize was not called.
 	SIZE szImage = { (int)cx, (int)cx };
 
+	// note: don't return false on a failure. false is 0, which is S_OK, and the shell would take the uninitialized bitmap as a success.
 	struct heif_error err;
 	err = heif_context_read_from_reader(_ctx, &_reader->_interface, _reader, NULL);
 	DBGPRINTF((L"heif_context_read_from_reader: code %d (subcode %d); '%S'", err.code, err.subcode, err.message));
 	if (err.code != 0)
 	{
-		return false;
+		return E_FAIL;
 	}
 	int num_images = heif_context_get_number_of_top_level_images(_ctx);
 	DBGPRINTF((L"heif_context_get_number_of_top_level_images: num_images=%d", num_images));
 	if (num_images == 0)
 	{
-		return false;
+		return E_FAIL;
 	}
 	struct heif_image_handle* image_handle = NULL;
 	err = heif_context_get_primary_image_handle(_ctx, &image_handle);
 	DBGPRINTF((L"heif_context_get_primary_image_handle: code %d (subcode %d); '%S'", err.code, err.subcode, err.message));
 	if (err.code)
 	{
-		return false;
+		return E_FAIL;
 	}
 
 	bool thumbnailFound = false;
@@ -95,7 +101,7 @@ STDMETHODIMP ThumbnailProviderImpl::GetThumbnail(/* [in] */ UINT cx, /* [out] */
 			if (err.code)
 			{
 				heif_image_handle_release(image_handle);
-				return false;
+				return E_FAIL;
 			}
 			hbmp = decodeHeif(thumbnail_handle, szImage);
 			heif_image_handle_release(thumbnail_handle);
@@ -178,7 +184,15 @@ HBITMAP ThumbnailProviderImpl::decodeHeif(struct heif_image_handle* image_handle
 		DBGPUTS((L"heif_image_get_plane_readonly: nullptr"));
 		return NULL;
 	}
-	ASSERT(src_stride / thumbnail_width == sizeof(RGBTRIPLE));
+	// copy only as many pixels as the decoded plane actually has. the size declared by the file may differ from it.
+	thumbnail_width = heif_image_get_width(image, heif_channel_interleaved);
+	thumbnail_height = heif_image_get_height(image, heif_channel_interleaved);
+	if (thumbnail_width <= 0 || thumbnail_height <= 0 || src_stride < thumbnail_width * (int)sizeof(RGBTRIPLE))
+	{
+		heif_image_release(image);
+		DBGPRINTF((L"decodeHeif: unexpected plane size: cx=%d, cy=%d, stride=%d", thumbnail_width, thumbnail_height, src_stride));
+		return NULL;
+	}
 
 	HDC hdc0 = CreateDC(L"DISPLAY", NULL, NULL, NULL);
 	HDC hdc = CreateCompatibleDC(hdc0);
