@@ -159,11 +159,14 @@ BOOL VIEWINFO::blendRect(HDC hdc, int x, int y, int cx, int cy, BYTE transparenc
 		UINT32* bits;
 		HBITMAP hbmp = CreateDIBSection(hdc2, &bmi, DIB_RGB_COLORS, (LPVOID*)&bits, NULL, 0);
 		if (hbmp) {
-			RECT rc = {0,0,cx,cy};
-			FillRect(hdc2, &rc, GetStockBrush(GRAY_BRUSH));
-			SelectObject(hdc2, hbmp);
+			// fill the bar in opaque gray. the old FillRect on hdc2 painted the dc's stock bitmap before hbmp was selected, so the bar was blended in all zeros and never showed on screen.
+			for (int i = 0; i < cx * cy; i++)
+				bits[i] = 0xFF808080;
+			HBITMAP hbmp0 = (HBITMAP)SelectObject(hdc2, hbmp);
 			BLENDFUNCTION bf = { AC_SRC_OVER, 0, transparency, 0 };
 			AlphaBlend(hdc, x, y, cx, cy, hdc2, 0, 0, cx, cy, bf);
+			// deselect hbmp. a bitmap cannot be deleted while it is selected into a dc.
+			SelectObject(hdc2, hbmp0);
 			DeleteObject(hbmp);
 		}
 		DeleteDC(hdc2);
