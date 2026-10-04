@@ -32,7 +32,7 @@ enum IMAGEFILETYPE { IFT_UNK, IFT_JPEG, IFT_HEIC, IFT_PNG, IFT_BMP, IFT_MAX };
 
 
 
-HeifImage::HeifImage() : _ctx(NULL), _hwnd(NULL), _imageHandle(NULL), _imageSize{ 0 }, _imageCount(0), _imagePath{ 0 }, _data{ 0 }, _resX(0), _resY(0), _resUnit(0)
+HeifImage::HeifImage() : _ctx(NULL), _hwnd(NULL), _imageHandle(NULL), _decoded(NULL), _imageSize{ 0 }, _imageCount(0), _imagePath{ 0 }, _data{ 0 }, _orientation(0), _resX(0), _resY(0), _resUnit(0)
 {
 }
 
@@ -99,6 +99,11 @@ void HeifImage::term()
 {
 	_clear();
 
+	if (_decoded)
+	{
+		heif_image_release(_decoded);
+		_decoded = NULL;
+	}
 	heif_image_handle_release(_imageHandle);
 	_imageHandle = NULL;
 	_imageCount = 0;
@@ -115,26 +120,30 @@ HBITMAP HeifImage::decode(SIZE viewSize)
 	if (viewSize.cx == 0 && viewSize.cy == 0)
 		viewSize = _imageSize;
 
-	struct heif_decoding_options* decode_options = heif_decoding_options_alloc();
-	decode_options->convert_hdr_to_8bit = true;
-
-	int bit_depth = 8;
-
-	struct heif_image* image = NULL;
 	struct heif_error err;
-	err = heif_decode_image(_imageHandle,
-		&image,
-		heif_colorspace_RGB,
-		heif_chroma_interleaved_RGB, // heif_chroma_interleaved_RGBA
-		decode_options);
-	if (err.code)
+	// decoding is the expensive part. do it once, and keep the full-scale image for later zooms.
+	if (!_decoded)
 	{
-		MessageBoxA(_hwnd, err.message, "heif_decode_image", MB_OK);
-		return NULL;
+		struct heif_decoding_options* decode_options = heif_decoding_options_alloc();
+		decode_options->convert_hdr_to_8bit = true;
+		err = heif_decode_image(_imageHandle,
+			&_decoded,
+			heif_colorspace_RGB,
+			heif_chroma_interleaved_RGB, // heif_chroma_interleaved_RGBA
+			decode_options);
+		heif_decoding_options_free(decode_options);
+		if (err.code)
+		{
+			_decoded = NULL;
+			MessageBoxA(_hwnd, err.message, "heif_decode_image", MB_OK);
+			return NULL;
+		}
 	}
-	ASSERT(image);
+	// image is either _decoded itself or a scaled copy of it. only a scaled copy is released at the end.
+	struct heif_image* image = _decoded;
 
 	SIZE destSize = _imageSize;
+	bool scale = false;
 
 	if (_imageSize.cx > viewSize.cx || _imageSize.cy > viewSize.cy)
 	{
@@ -149,32 +158,28 @@ HBITMAP HeifImage::decode(SIZE viewSize)
 			destSize.cx = MulDiv(viewSize.cy, _imageSize.cx, _imageSize.cy);
 			destSize.cy = viewSize.cy;
 		}
-		struct heif_image* scaled_image = NULL;
-		err = heif_image_scale_image(image, &scaled_image, destSize.cx, destSize.cy, NULL);
-		if (err.code)
-		{
-			heif_image_release(image);
-			MessageBoxA(_hwnd, err.message, "heif_image_scale_image", MB_OK);
-			return NULL;
-		}
-		heif_image_release(image);
-		image = scaled_image;
+		scale = true;
 	}
 	else if (_imageSize.cx < viewSize.cx && _imageSize.cy < viewSize.cy)
 	{
 		// zoom in (expand)
 		destSize.cy = MulDiv(viewSize.cx, _imageSize.cy, _imageSize.cx);
 		destSize.cx = viewSize.cx;
-
+		scale = true;
+	}
+	if (scale)
+	{
+		if (destSize.cx < 1)
+			destSize.cx = 1;
+		if (destSize.cy < 1)
+			destSize.cy = 1;
 		struct heif_image* scaled_image = NULL;
-		err = heif_image_scale_image(image, &scaled_image, destSize.cx, destSize.cy, NULL);
+		err = heif_image_scale_image(_decoded, &scaled_image, destSize.cx, destSize.cy, NULL);
 		if (err.code)
 		{
-			heif_image_release(image);
 			MessageBoxA(_hwnd, err.message, "heif_image_scale_image", MB_OK);
 			return NULL;
 		}
-		heif_image_release(image);
 		image = scaled_image;
 	}
 
@@ -182,11 +187,21 @@ HBITMAP HeifImage::decode(SIZE viewSize)
 	const BYTE* srcData = heif_image_get_plane_readonly(image, heif_channel_interleaved, &srcStride);
 	if (!srcData)
 	{
-		heif_image_release(image);
+		if (image != _decoded)
+			heif_image_release(image);
 		MessageBoxA(_hwnd, "Unexpected NULL pointer received", "heif_image_get_plane_readonly", MB_OK);
 		return NULL;
 	}
-	ASSERT(srcStride / destSize.cx == sizeof(RGBTRIPLE));
+	// copy only as many pixels as the decoded plane actually has. the size declared by the file may differ from it.
+	destSize.cx = heif_image_get_width(image, heif_channel_interleaved);
+	destSize.cy = heif_image_get_height(image, heif_channel_interleaved);
+	if (destSize.cx <= 0 || destSize.cy <= 0 || srcStride < destSize.cx * (int)sizeof(RGBTRIPLE))
+	{
+		if (image != _decoded)
+			heif_image_release(image);
+		MessageBoxA(_hwnd, "Decoded image has an unexpected size", "heif_image_get_plane_readonly", MB_OK);
+		return NULL;
+	}
 
 	HDC hdc0 = GetDC(_hwnd);
 	HDC hdc = CreateCompatibleDC(hdc0);
@@ -233,7 +248,8 @@ HBITMAP HeifImage::decode(SIZE viewSize)
 #endif//_DEBUG
 	}
 
-	heif_image_release(image);
+	if (image != _decoded)
+		heif_image_release(image);
 	return hbmp;
 }
 
@@ -361,17 +377,30 @@ bool HeifImage::hasFullscaleData()
 	return false;
 }
 
+// newSize receives the extents of the returned bitmap. they are swapped if the image is rotated by 90 or 270 degrees.
 HBITMAP HeifImage::zoom(int ratio, SIZE &newSize)
 {
+	// keep the rotation. _clear() resets it, and decode() produces the image unrotated.
+	int rotated = _data.rotated % 4;
 	_clear();
 
-	newSize = _imageSize;
+	SIZE viewSize = _imageSize;
 	if (ratio != 0 && ratio != 100)
 	{
-		newSize.cx = MulDiv(ratio, _imageSize.cx, 100);
-		newSize.cy = MulDiv(ratio, _imageSize.cy, 100);
+		viewSize.cx = MulDiv(ratio, _imageSize.cx, 100);
+		viewSize.cy = MulDiv(ratio, _imageSize.cy, 100);
 	}
-	return decode(newSize);
+	HBITMAP hbmp = decode(viewSize);
+	newSize = _data.dims;
+	if (hbmp && rotated)
+	{
+		// rotate() turns the image by one more quarter. start one quarter short of the old angle.
+		_data.rotated = rotated - 1;
+		HBITMAP hbmpRotated = rotate(newSize);
+		DeleteObject(hbmp);
+		hbmp = hbmpRotated;
+	}
+	return hbmp;
 }
 
 void _rotateImage(HeifImage::DecodedImageData &src, RGBQUAD *dest)
@@ -426,7 +455,7 @@ void _rotateImage(HeifImage::DecodedImageData &src, RGBQUAD *dest)
 HBITMAP HeifImage::rotate(SIZE &newSize)
 {
 	if (!_data.bits)
-		return false; // make sure decode is called before you use rotate.
+		return NULL; // make sure decode is called before you use rotate.
 
 	// swap the image width and height if this is an even-numbered call. if this is the first rotation, the original top and bottom become right and left sides.
 	SIZE destSize = _data.dims;
@@ -616,6 +645,9 @@ struct APP1_EXIF {
 
 bool HeifImage::_parseExif(std::vector<BYTE> &metadata)
 {
+	// the block must be large enough to hold the 4-byte prefix, the 'Exif' signature and the tiff header.
+	if (metadata.size() < 4 + FIELD_OFFSET(APP1_EXIF, IFD0))
+		return false;
 	// skip the first 4 bytes to get to the exif/tiff header.
 	LPBYTE p0 = metadata.data()+4;
 	int len0 = (int)metadata.size()-4;
@@ -633,12 +665,15 @@ bool HeifImage::_parseExif(std::vector<BYTE> &metadata)
 		return false;
 	_ifd.push_back(ifd0);
 	// the offset to another IFD (called IFD1) immediately follows IFD0. it contains a thumbnail image.
-	ULONG offsetIfd1 = ifd0.getULONG(ifd0._basePtr+ifd0._offset+len);
+	ULONG offsetIfd1 = 0;
+	if (ifd0._offset + len + (int)sizeof(ULONG) <= ifd0._baseLen)
+		offsetIfd1 = ifd0.getULONG(ifd0._basePtr+ifd0._offset+len);
 	// IFD0 includes an offset to a sub-IFD called 'Exif IFD'. it holds image configuration info.
+	// use _getIntValueOf to read the offsets. it checks that the attribute has data to read.
 	const ExifIfdAttribute *offsetToIfd = ifd0.find(ExifIfdAttribute::OffsetToExifIFD);
 	if (offsetToIfd)
 	{
-		ULONG offsetExifIfd = ifd0.getULONG((LPVOID)offsetToIfd->_value.data());
+		ULONG offsetExifIfd = ifd0._getIntValueOf(offsetToIfd);
 		ExifIfd ifdExif(EXIFIFDCLASS_EXIF, ifd0._basePtr, ifd0._baseLen, ifd0._big);
 		len = ifdExif.parse(offsetExifIfd);
 		_ifd.push_back(ifdExif);
@@ -647,7 +682,7 @@ bool HeifImage::_parseExif(std::vector<BYTE> &metadata)
 	offsetToIfd = ifd0.find(ExifIfdAttribute::OffsetToGpsIFD);
 	if (offsetToIfd)
 	{
-		ULONG offsetGpsIfd = ifd0.getULONG((LPVOID)offsetToIfd->_value.data());
+		ULONG offsetGpsIfd = ifd0._getIntValueOf(offsetToIfd);
 		ExifIfd ifdGps(EXIFIFDCLASS_GPS, ifd0._basePtr, ifd0._baseLen, ifd0._big);
 		len = ifdGps.parse(offsetGpsIfd);
 		_ifd.push_back(ifdGps);

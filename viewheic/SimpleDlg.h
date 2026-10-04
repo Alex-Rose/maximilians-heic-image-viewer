@@ -52,6 +52,7 @@ public:
 		if (_hdlg)
 			::DestroyWindow(_hdlg);
 	}
+	HWND GetHwnd() const { return _hdlg; }
 	INT_PTR DoModal()
 	{
 		return DialogBoxParam(
@@ -83,6 +84,9 @@ protected:
 	virtual void OnContextMenu(HWND hwnd, int x, int y) {}
 	virtual void OnTimer(WPARAM nIDEvent) {}
 	virtual void OnSize(UINT nType, int cx, int cy) {}
+	virtual BOOL OnGetMinMaxInfo(LPMINMAXINFO pMMI) { return FALSE; }
+	virtual void OnEnterSizeMove() {}
+	virtual void OnExitSizeMove() {}
 	virtual void OnMove(int x, int y) {}
 	virtual BOOL OnDrawItem(UINT idCtrl, LPDRAWITEMSTRUCT pDIS) { return FALSE; }
 	virtual BOOL OnLButtonDown(INT_PTR nButtonType, POINT pt) { return FALSE; }
@@ -125,8 +129,28 @@ private:
 		}
 		else if (m_ == WM_SIZE)
 		{
-			pThis->OnSize((UINT)(ULONG_PTR)wp_, GET_X_LPARAM(lp_), GET_Y_LPARAM(lp_));
+			if (pThis)
+				pThis->OnSize((UINT)(ULONG_PTR)wp_, GET_X_LPARAM(lp_), GET_Y_LPARAM(lp_));
 			return TRUE;
+		}
+		else if (m_ == WM_GETMINMAXINFO)
+		{
+			// this arrives before WM_INITDIALOG. pThis is not set yet then.
+			if (pThis && pThis->OnGetMinMaxInfo((LPMINMAXINFO)lp_))
+			{
+				::SetWindowLongPtr(h_, DWLP_MSGRESULT, 0);
+				return TRUE;
+			}
+		}
+		else if (m_ == WM_ENTERSIZEMOVE)
+		{
+			if (pThis)
+				pThis->OnEnterSizeMove();
+		}
+		else if (m_ == WM_EXITSIZEMOVE)
+		{
+			if (pThis)
+				pThis->OnExitSizeMove();
 		}
 		else if (m_ == WM_MOVE)
 		{

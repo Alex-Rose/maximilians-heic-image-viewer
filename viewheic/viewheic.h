@@ -24,7 +24,6 @@
 #include "SimpleDlg.h"
 #include "resource.h"
 #include "HeifImage.h"
-#include "ToolsDlg.h"
 
 
 // flags for VIEWINFO.scrollH and scrollV
@@ -69,26 +68,40 @@ struct VIEWINFO
 class MainDlg : public SimpleDlg
 {
 public:
-	MainDlg(const std::wstring &path) : SimpleDlg(IDD_MAIN), _filename(path), _tools(NULL), _heif(NULL), _hbmpImage(NULL), _heifFlags(0) {}
+	MainDlg(const std::wstring &path) : SimpleDlg(IDD_MAIN), _nextFilename(path), _heif(NULL), _hbmpImage(NULL), _heifFlags(0), _frameMargins{ 0 }, _hbrBack(NULL), _wheelDelta(0), _photoIndex(0), _photoCount(0),
+		_fitMode(false), _userSized(false), _inSizeMove(false), _sizeBeforeMove{ 0 }, _sizingWindow(false), _panning(false), _panStart{ 0 }, _panOrigin{ 0 } {}
 
 protected:
 	VIEWINFO _vi;
-	std::wstring _filename;
+	std::wstring _filename; // the photo being shown. empty until the first photo opens.
+	std::wstring _nextFilename; // the photo IDM_DECODE should open.
 	HBITMAP _hbmpImage;
 	HeifImage *_heif;
 	ULONG _heifFlags;
-	ToolsDlg *_tools;
 	SIZE _frameMargins;
+	HBRUSH _hbrBack;
+	int _wheelDelta; // ctrl+wheel rotation not yet turned into a zoom step. touchpads report less than a notch at a time.
+	int _photoIndex, _photoCount; // 1-based position of the photo among the heic photos in its folder, and their number.
+	bool _fitMode; // the zoom fits the photo in the window. resizing the window fits it again.
+	bool _userSized; // the user has resized the window. keep that size for the next photos.
+	bool _inSizeMove; // the user is dragging the window frame.
+	SIZE _sizeBeforeMove; // the page size when the frame drag started.
+	bool _sizingWindow; // _sizeWindow is resizing the window. the resulting WM_SIZE is not the user's doing.
+	bool _panning; // the user is dragging the photo.
+	POINT _panStart, _panOrigin; // cursor position and ptPage when the drag started.
 
 	virtual BOOL OnInitDialog();
 	virtual void OnDestroy();
-	virtual void OnMove(int x, int y);
+	virtual BOOL OnOK();
+	virtual BOOL OnCancel();
 	virtual void OnSize(UINT nType, int cx, int cy);
+	virtual BOOL OnGetMinMaxInfo(LPMINMAXINFO pMMI);
+	virtual void OnEnterSizeMove();
+	virtual void OnExitSizeMove();
 	virtual BOOL OnLButtonDown(INT_PTR nButtonType, POINT pt);
 	virtual BOOL OnLButtonUp(INT_PTR nButtonType, POINT pt);
 	virtual BOOL OnMouseMove(UINT state, POINT pt);
 	virtual BOOL OnMouseWheel(short nButtonType, short nWheelDelta, POINT pt);
-	virtual BOOL OnSysCommand(WPARAM wp_, LPARAM lp_);
 	virtual BOOL OnCommand(WPARAM wp_, LPARAM lp_);
 	virtual BOOL OnPaint();
 	virtual BOOL OnEraseBkgnd(HDC hdc);
@@ -97,8 +110,17 @@ protected:
 	void OnButtonSaveAs();
 	void OnButtonPrint();
 	void OnButtonRotate();
-	void OnButtonZoom();
 
+	void _openFile(const std::wstring &path);
+	void _openSibling(int step);
+	void _updatePhotoPosition();
+	void _setZoom(int ratio, POINT anchor);
+	void _refit();
+	bool _keepWindowSize();
+	void _stepZoom(int steps, POINT anchor);
+	int _fitZoom();
+	POINT _pageCenter();
+	void _layoutPage();
 	void _sizeWindow(SIZE imageSize);
 	void _autoZoom(bool syncParams=false);
 	void _setCaption(ULONG flags=0);
