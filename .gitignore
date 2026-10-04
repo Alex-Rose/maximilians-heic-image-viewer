@@ -1,0 +1,49 @@
+# Visual Studio build output (msbuild puts it next to the solution and in each project folder)
+[Dd]ebug/
+[Rr]elease/
+x64/
+x86/
+Win32/
+ARM64/
+
+# Visual Studio state and per-user settings
+.vs/
+*.user
+*.suo
+*.aps
+*.ncb
+*.sdf
+*.opensdf
+*.VC.db
+*.VC.opendb
+ipch/
+
+# compiler and linker intermediates
+*.obj
+*.pch
+*.pdb
+*.ilk
+*.idb
+*.iobj
+*.ipdb
+*.exp
+*.res
+*.tlog
+*.lastbuildstate
+*.log
+
+# installer build: staging folder, generated msi/setup files and script logs
+installer/work/
+installer/out/
+installer/*.js.log
+
+# third-party libraries (libheif and its dependencies) supplied locally for the installer
+/lib/
+vcpkg_installed/
+
+# code signing material. never commit certificates or private keys.
+*.pfx
+*.pvk
+*.cer
+*.p12
+*.snk
